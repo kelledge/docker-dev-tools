@@ -1,0 +1,184 @@
+#!/usr/bin/env python
+"""
+Proof-of-concept
+"""
+
+
+import os
+import sys
+import json
+import logging
+
+from pprint import pprint
+from docker import Client
+
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger()
+
+
+def image_ready(client, image_name):
+    for image in client.images():
+        if image_name in image['RepoTags']:
+            return True
+
+    return False
+
+
+def pull_image(client, image_name):
+    stream = client.pull(
+        image_name,
+        stream=True
+    )
+    for record in stream:
+        logger.info(record)
+
+
+def build_image(client, image_name, dockerfile_dir, dockerfile_file):
+    stream = client.build(
+        tag=image_name,
+        path=dockerfile_dir,
+        fileobj=dockerfile_file,
+        rm=True,
+        forcerm=True,
+        stream=True
+    )
+    for record in stream:
+        logger.info(record)
+
+
+def docker_exec(client, cwd, relpath, image_name, command):
+
+    host_config = client.create_host_config(binds=[
+        '%s:/idkfa' % cwd
+    ])
+
+
+    container = client.create_container(
+        image=image_name,
+        #entrypoint=['/bin/sh', '-c'],
+        command=command,
+        tty=True,
+        working_dir=relpath,
+        volumes='/idkfa',
+        host_config=host_config
+    )
+
+    logger.info(container.get('Id'))
+
+    stream = client.attach(
+        container=container.get('Id'),
+        stream=True,
+        stdout=True,
+        stderr=True,
+        logs=True
+    )
+    response = client.start(container=container.get('Id'))
+
+    for record in stream:
+        logger.info(record)
+
+    client.remove_container(
+        container=container.get('Id'),
+        v=True,
+        force=True
+    )
+
+
+def split(path):
+    """
+    Split a path in to a list of its directories
+    """
+
+    head = path
+    dirs = []
+
+    while True:
+        head, tail = os.path.split(head)
+        if tail:
+            dirs.append(tail)
+        else:
+            break
+
+    return list(reversed(dirs))
+
+
+def parents(path):
+    """
+    Yields all parent directories as absolute paths
+    """
+    dirs = split(path)
+    for _ in range(len(dirs)):
+        yield os.path.join('/', *dirs)
+        dirs.pop()
+
+    yield '/'
+
+
+def search_parents(name, cwd):
+    """
+    Search parent directories for a named file
+    """
+    for pdir in parents(cwd):
+        if name in os.listdir(pdir):
+            return os.path.join(pdir, name)
+
+    return None
+
+
+def load(path):
+    try:
+        with open(path) as handle:
+            return json.load(handle)
+
+    except Exception as e:
+        logger.error("Error loading %s", path)
+        logger.error(e)
+
+
+def main(client, cwd, command):
+
+    config_path = search_parents('.idkfa', cwd)
+    config = load(config_path)
+
+
+    root = os.path.dirname(config_path)
+
+    relpath = os.path.join('/idkfa', *list(set(split(cwd)) - set(split(root))))
+    pprint(relpath)
+
+    pprint(config)
+
+    if not image_ready(client, config['image']):
+        logger.info('image not ready, building')
+
+        if ('image' in config) and ('dockerfile' in config):
+            logger.info('building image')
+            with open(os.path.join(cwd, config['dockerfile'])) as handle:
+                build_image(client, config['image'], cwd, handle)
+        elif ('image' in config):
+            logger.info('pulling image')
+            pull_image(client, config['image'])
+        else:
+            logger.error('Invalid config')
+
+    else:
+        logger.info('image ready')
+
+    docker_exec(client, root, relpath, config['image'], command)
+
+
+
+
+
+if __name__ == '__main__':
+    cwd = os.getcwd()
+    command = sys.argv[1:]
+
+    if command == []:
+        logger.error('no command')
+        sys.exit(1)
+
+    pprint(' '.join(command))
+    client = Client(base_url='unix://var/run/docker.sock', version='auto')
+    main(client, cwd, command)
